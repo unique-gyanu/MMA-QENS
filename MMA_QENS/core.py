@@ -1,359 +1,31 @@
 import numpy as np
-import scipy as sp
-import matplotlib
 
-
-#from numpy.fft import fft, ifft
-from scipy.fft import fft, ifft
 import matplotlib.pyplot as plt
 
-from scipy import stats, integrate
-from scipy.optimize import curve_fit, minimize
+import scipy as sp
+from scipy.fft import fft, ifft
+from scipy import stats
+from scipy.optimize import curve_fit
 from scipy import constants as const
 from scipy.special import gamma
-from scipy.stats import chi2
 
-import numpy as np
-
-import iminuit
 from iminuit import Minuit
 
-from PyDynamic.uncertainty.propagate_DFT import GUM_DFT
+from PyDynamic.uncertainty.propagate_DFT import GUM_DFT # used for error propagation
 
-#from pythonpackage.ExternalFunctions import Chi2Regression, BinnedLH, UnbinnedLH
-#from pythonpackage.ExternalFunctions import nice_string_output, add_text_to_ax   # Useful functions to print fit results on figure
-
-def format_value(value, decimals):
-    """ 
-    Checks the type of a variable and formats it accordingly.
-    Floats has 'decimals' number of decimals.
-    """
-    
-    if isinstance(value, (float, np.float64)):
-        return f'{value:.{decimals}f}'
-    elif isinstance(value, (int, np.integer)):
-        return f'{value:d}'
-    else:
-        return f'{value}'
-
-
-def values_to_string(values, decimals):
-    """ 
-    Loops over all elements of 'values' and returns list of strings
-    with proper formating according to the function 'format_value'. 
-    """
-    
-    res = []
-    for value in values:
-        if isinstance(value, list):
-            tmp = [format_value(val, decimals) for val in value]
-            res.append(f'{tmp[0]} +/- {tmp[1]}')
-        else:
-            res.append(format_value(value, decimals))
-    return res
-
-
-def len_of_longest_string(s):
-    """ Returns the length of the longest string in a list of strings """
-    return len(max(s, key=len))
-
-
-def nice_string_output(d, extra_spacing=5, decimals=3):
-    """ 
-    Takes a dictionary d consisting of names and values to be properly formatted.
-    Makes sure that the distance between the names and the values in the printed
-    output has a minimum distance of 'extra_spacing'. One can change the number
-    of decimals using the 'decimals' keyword.  
-    """
-    
-    names = d.keys()
-    max_names = len_of_longest_string(names)
-    
-    values = values_to_string(d.values(), decimals=decimals)
-    max_values = len_of_longest_string(values)
-    
-    string = ""
-    for name, value in zip(names, values):
-        spacing = extra_spacing + max_values + max_names - len(name) - 1 
-        string += "{name:s} {value:>{spacing}} \n".format(name=name, value=value, spacing=spacing)
-    return string[:-2]
-
-
-def add_text_to_ax(x_coord, y_coord, string, ax, fontsize=12, color='k'):
-    """ Shortcut to add text to an ax with proper font. Relative coords."""
-    ax.text(x_coord, y_coord, string, family='monospace', fontsize=fontsize,
-            transform=ax.transAxes, verticalalignment='top', color=color)
-    return None
-
-# =============================================================================
-#  Probfit replacement
-# =============================================================================
-
-from iminuit.util import make_func_code
-from iminuit import describe #, Minuit,
-
-def set_var_if_None(var, x):
-    if var is not None:
-        return np.array(var)
-    else: 
-        return np.ones_like(x)
-    
-def compute_f(f, x, *par):
-    
-    try:
-        return f(x, *par)
-    except ValueError:
-        return np.array([f(xi, *par) for xi in x])
-
-
-class Chi2Regression:  # override the class with a better one
-    
-    def __init__(self, f, x, y, sy=None, weights=None):
-        
-        self.f = f  # model predicts y for given x
-        self.x = np.array(x)
-        self.y = np.array(y)
-        
-        self.sy = set_var_if_None(sy, self.x)
-        self.weights = set_var_if_None(weights, self.x)
-        self.func_code = make_func_code(describe(self.f)[1:])
-
-    def __call__(self, *par):  # par are a variable number of model parameters
-        
-        # compute the function value
-        f = compute_f(self.f, self.x, *par)
-        
-        # compute the chi2-value
-        chi2 = np.sum(self.weights*(self.y - f)**2/self.sy**2)
-        
-        return chi2
-
-def simpson38(f, edges, bw, *arg):
-    
-    yedges = f(edges, *arg)
-    left38 = f((2.*edges[1:]+edges[:-1]) / 3., *arg)
-    right38 = f((edges[1:]+2.*edges[:-1]) / 3., *arg)
-    
-    return bw / 8.*( np.sum(yedges)*2.+np.sum(left38+right38)*3. - (yedges[0]+yedges[-1]) ) #simpson3/8
-
-
-def integrate1d(f, bound, nint, *arg):
-    """
-    compute 1d integral
-    """
-    edges = np.linspace(bound[0], bound[1], nint+1)
-    bw = edges[1] - edges[0]
-    
-    return simpson38(f, edges, bw, *arg)
-
-
-
-class UnbinnedLH:  # override the class with a better one
-    
-    def __init__(self, f, data, weights=None, badvalue=-100000, extended=False, extended_bound=None, extended_nint=100):
-        
-        self.f = f  # model predicts PDF for given x
-        self.data = np.array(data)
-        self.weights = set_var_if_None(weights, self.data)
-        self.bad_value = badvalue
-        
-        self.extended = extended
-        self.extended_bound = extended_bound
-        self.extended_nint = extended_nint
-        if extended and extended_bound is None:
-            self.extended_bound = (np.min(data), np.max(data))
-
-        
-        self.func_code = make_func_code(describe(self.f)[1:])
-
-    def __call__(self, *par):  # par are a variable number of model parameters
-        
-        logf = np.zeros_like(self.data)
-        
-        # compute the function value
-        f = compute_f(self.f, self.data, *par)
-    
-        # find where the PDF is 0 or negative (unphysical)        
-        mask_f_positive = (f>0)
-
-        # calculate the log of f everyhere where f is positive
-        logf[mask_f_positive] = np.log(f[mask_f_positive]) * self.weights[mask_f_positive] 
-        
-        # set everywhere else to badvalue
-        logf[~mask_f_positive] = self.bad_value
-        
-        # compute the sum of the log values: the LLH
-        llh = -np.sum(logf)
-        
-        if self.extended:
-            extended_term = integrate1d(self.f, self.extended_bound, self.extended_nint, *par)
-            llh += extended_term
-        
-        return llh
-    
-    def default_errordef(self):
-        return 0.5
-
-
-
-
-
-class BinnedLH:  # override the class with a better one
-    
-    def __init__(self, f, data, bins=40, weights=None, weighterrors=None, bound=None, badvalue=1000000, extended=False, use_w2=False, nint_subdiv=1):
-        
-        self.weights = set_var_if_None(weights, data)
-
-
-        self.f = f
-        self.use_w2 = use_w2
-        self.extended = extended
-
-        if bound is None: 
-            bound = (np.min(data), np.max(data))
-
-        self.mymin, self.mymax = bound
-
-        h, self.edges = np.histogram(data, bins, range=bound, weights=weights)
-        
-        self.bins = bins
-        self.h = h
-        self.N = np.sum(self.h)
-
-        if weights is not None:
-            if weighterrors is None:
-                self.w2, _ = np.histogram(data, bins, range=bound, weights=weights**2)
-            else:
-                self.w2, _ = np.histogram(data, bins, range=bound, weights=weighterrors**2)
-        else:
-            self.w2, _ = np.histogram(data, bins, range=bound, weights=None)
-
-
-        
-        self.badvalue = badvalue
-        self.nint_subdiv = nint_subdiv
-        
-        
-        self.func_code = make_func_code(describe(self.f)[1:])
-        self.ndof = np.sum(self.h > 0) - (self.func_code.co_argcount - 1)
-        
-
-    def __call__(self, *par):  # par are a variable number of model parameters
-
-        # ret = compute_bin_lh_f(self.f, self.edges, self.h, self.w2, self.extended, self.use_w2, self.badvalue, *par)
-        ret = compute_bin_lh_f2(self.f, self.edges, self.h, self.w2, self.extended, self.use_w2, self.nint_subdiv, *par)
-        
-        return ret
-
-
-    def default_errordef(self):
-        return 0.5
-
-
-
-
-import warnings
-
-
-def xlogyx(x, y):
-    
-    #compute x*log(y/x) to a good precision especially when y~x
-    
-    if x<1e-100:
-        warnings.warn('x is really small return 0')
-        return 0.
-    
-    if x<y:
-        return x*np.log1p( (y-x) / x )
-    else:
-        return -x*np.log1p( (x-y) / y )
-
-
-#compute w*log(y/x) where w < x and goes to zero faster than x
-def wlogyx(w, y, x):
-    if x<1e-100:
-        warnings.warn('x is really small return 0')
-        return 0.
-    if x<y:
-        return w*np.log1p( (y-x) / x )
-    else:
-        return -w*np.log1p( (x-y) / y )
-
-
-def compute_bin_lh_f2(f, edges, h, w2, extended, use_sumw2, nint_subdiv, *par):
-    
-    N = np.sum(h)
-    n = len(edges)
-
-    ret = 0.
-    
-    for i in range(n-1):
-        th = h[i]
-        tm = integrate1d(f, (edges[i], edges[i+1]), nint_subdiv, *par)
-        
-        if not extended:
-            if not use_sumw2:
-                ret -= xlogyx(th, tm*N) + (th-tm*N)
-
-            else:
-                if w2[i]<1e-200: 
-                    continue
-                tw = w2[i]
-                factor = th/tw
-                ret -= factor*(wlogyx(th,tm*N,th)+(th-tm*N))
-        else:
-            if not use_sumw2:
-                ret -= xlogyx(th,tm)+(th-tm)
-            else:
-                if w2[i]<1e-200: 
-                    continue
-                tw = w2[i]
-                factor = th/tw
-                ret -= factor*(wlogyx(th,tm,th)+(th-tm))
-
-    return ret
-
-
-
-
-
-def compute_bin_lh_f(f, edges, h, w2, extended, use_sumw2, badvalue, *par):
-    
-    mask_positive = (h>0)
-    
-    N = np.sum(h)
-    midpoints = (edges[:-1] + edges[1:]) / 2
-    b = np.diff(edges)
-    
-    midpoints_pos = midpoints[mask_positive]
-    b_pos = b[mask_positive]
-    h_pos = h[mask_positive]
-    
-    if use_sumw2:
-        warnings.warn('use_sumw2 = True: is not yet implemented, assume False ')
-        s = np.ones_like(midpoints_pos)
-        pass
-    else: 
-        s = np.ones_like(midpoints_pos)
-
-    
-    E_pos = f(midpoints_pos, *par) * b_pos
-    if not extended:
-        E_pos = E_pos * N
-        
-    E_pos[E_pos<0] = badvalue
-    
-    ans = -np.sum( s*( h_pos*np.log( E_pos/h_pos ) + (h_pos-E_pos) ) )
-
-    return ans
+from pythonpackage.ExternalFunctions import Chi2Regression, BinnedLH, UnbinnedLH
 
 #====================================================================        
 #                           Fitting Model
 #====================================================================
 
-def fqt_model(t,tau,alpha,eisf):
+def fqt_model1(t,tau,alpha,eisf):
     time = (-(t/tau)**alpha)    
     return eisf + (1-eisf)*ml(time,alpha)
+
+def fqt_model2(t, tau, alpha, eisf):
+    time = (-(t/tau)**alpha)
+    return eisf + (1-eisf)*np.exp(time)
 
 def ml(z, alpha, beta=1., gama=1.):
     eps = np.finfo(np.float64).eps
@@ -608,556 +280,1110 @@ def calc_chi2(y_data, y_fit, sigmas):
     return Chi2/Ndof,Ndof, Probchi2 
 
 class Minimal_Model:
-    def __init__(self, sqw, vana_sqw, sqwerror, vana_sqwerror, Q, omega, filename,index = 1 , T=300): 
+    """
+    Minimal model for analysing QENS data.
+
+    The class stores the measured S(Q, ω), vanadium resolution data,
+    associated uncertainties, Q-values, and energy-transfer axes.
+
+    All energy-dependent quantities are converted internally to lists
+    of NumPy arrays, with one array corresponding to each Q-value.
+    """
+
+    def __init__(self, sqw, vana_sqw, sqwerror, vana_sqwerror, Q, omega,
+                 filename, index=1, T=300):
         """
-        The minimal model approach for analysis of quasi-elastic neutron scattering. The original python script was written by Martin Hoffmann Petersen. 
-        
-        Parameters:
+        Initialize the Minimal_Model object.
+
+        Parameters
         ----------
-            sqw : numpy.ndarray
-                A 2D ``array`` of the measured QENS spectra.
-            vana_sqw : numpy.ndarray
-                A 2D ``array`` of the measured vanadium QENS spectra.
-            sqwerror : numpy.ndarray
-                A 2D ``array`` of the uncertanties for the measured QENS spectra.
-            vana_sqwerror : numpy.ndarray
-                A 2D ``array`` of the uncertanties for the measured vanadium QENS spectra.
-            Q : numpy.ndarray
-                A 1D ``array`` of Q-values in Å.
-            filename : string
-                A string containing the name of the measured sample.
-            omega : numpy.ndarray
-                A 1D ``array`` of energy transfer in meV.
-            index : int, optional
-                A int, who makes the spacing in the spectra larger. Deafult is 1
-            T : int
-                A int of the sample tempetures in Kelvin
+        sqw : array-like
+            Measured S(Q, ω) data.
+
+        vana_sqw : array-like
+            Vanadium S(Q, ω) data used to represent the instrumental
+            resolution function.
+
+        sqwerror : array-like
+            Uncertainties associated with the measured S(Q, ω).
+
+        vana_sqwerror : array-like
+            Uncertainties associated with the vanadium data.
+
+        Q : array-like
+            Momentum-transfer values.
+
+        omega : array-like
+            Energy-transfer axis or axes corresponding to the S(Q, ω) data.
+
+        filename : str
+            Name used to identify the dataset and for saving output.
+
+        index : int, optional
+            Step size used when sampling the energy-transfer axis.
+            The default value is 1, which keeps every point.
+
+        T : float, optional
+            Sample temperature in Kelvin. Default is 300 K.
         """
-        self.sqw = sqw
-        self.vana_sqw = vana_sqw
-        self.sqwerror = sqwerror
-        self.vana_sqwerror = vana_sqwerror
-        self.Q = Q
-        self.omega = omega
+        self.Q = np.asarray(Q, dtype=float)
+        self.NQ = len(self.Q)
+        self.filename = filename
         self.index = index
         self.T = T
-        self.filename = filename
 
-        self.omeganew = self.omega[::self.index] # prepares the new omega array with respect to the index
-        self.NQ = len(self.Q)
-        self.Nomega= len(self.omeganew)
+        def ensure_list_of_arrays(x, name):
+            """
+            Convert input data into a list of NumPy arrays.
 
-        self.symmetrized = None
-        self.deconvolved = None
-        self.fitted = None
-        self.resampled = None
-        
-    def Sym_Norm(self, usespectra = 'negative', yscale='log', xlim=(-0.25, 0.25), ylim=None, showplot=True, saveplot=False):
+            The internal data structure requires one array for each Q-value.
+            This function allows the input to be supplied either as:
+
+            1. A list or tuple containing one array per Q-value.
+            2. A 2D NumPy array where each row corresponds to one Q-value.
+            3. A single 1D array, which is copied for every Q-value.
+
+            Parameters
+            ----------
+            x : array-like
+                Input data to convert.
+
+            name : str
+                Name of the input variable, used in error messages.
+
+            Returns
+            -------
+            list of numpy.ndarray
+                One floating-point NumPy array for each Q-value.
+            """
+
+            if isinstance(x, (list, tuple)):
+
+                # The number of arrays must match the number of Q-values.
+                if len(x) != self.NQ:
+                    raise ValueError(f"{name} length must match number of Q points")
+                return [np.asarray(row, dtype=float) for row in x]
+            
+            else:
+                # Convert other array-like input to a NumPy array.
+                arr = np.asarray(x, dtype=float)
+                # If a single 2D array was passed, split by rows
+                if arr.ndim == 2 and arr.shape[0] == self.NQ:
+                    return [arr[i].astype(float) for i in range(self.NQ)]
+                
+                # If only one 1D array is supplied, use the same axis/data
+                # structure for every Q-value.
+                elif arr.ndim == 1:
+                    # single energy transfer vector passed for all Q
+                    return [arr.copy() for _ in range(self.NQ)]
+                else:
+                    raise ValueError(f"Unsupported shape for {name}")
+                
+        # Standardize all Q-dependent datasets to the same internal format:
+        # one NumPy array for each Q-value.
+        self.sqw = ensure_list_of_arrays(sqw, "sqw")
+        self.vana_sqw = ensure_list_of_arrays(vana_sqw, "vana_sqw")
+        self.sqwerror = ensure_list_of_arrays(sqwerror, "sqwerror")
+        self.vana_sqwerror = ensure_list_of_arrays(vana_sqwerror, "vana_sqwerror")
+        self.omega = ensure_list_of_arrays(omega, "omega")
+
+        # Downsample each energy-transfer axis according to the chosen index.
+        # For index = 1, all points are retained.
+        # For index = 2, every second point is retained, etc.
+        self.omeganew = [w[::self.index] for w in self.omega]
+        self.Nomega = [len(w) for w in self.omeganew]
+
+    def Sym_Norm(self, usespectra='negative', yscale='log', xlim=(-0.25, 0.25), ylim=None, showplot=True, saveplot=False):
         """
-        The Symmetrization and normalization of the measured QENS spectra:
-        
-        Parameters:
-        ----------
-            symside : string
-                A string to choose which part of the spectrum to use 
-            yscale : string, optional
-                A string setting the y-axis scale of the plots. If 'None' then the scale is in 'log'
-            xlim : tuple, optional 
-                A tuple setting the x-axis range. If 'None' then defult setting is used
-            ylim : tuple, optional
-                A tuple setting the y-axis range. If 'None' the y-axis is not limited
-            showplot : bool, optional
-                If 'True', all plots are shown. Default is 'True'
-            saveplot : bool, optional
-                If 'True', all shown plots are saved as png-files. Default is 'False'.
-        """
+    Symmetrize and normalize the measured QENS and vanadium spectra.
+
+    The measured S(Q, ω) spectra are first symmetrized around zero energy
+    transfer using either the negative- or positive-energy side of the
+    spectrum. A detailed-balance correction is applied
+    before mirroring the selected side.
+
+    The symmetrized spectra are then corrected for Q-dependent variations
+    in the integrated vanadium intensity. Finally, both the sample and
+    vanadium spectra are normalized by their integrated intensity.
+
+    Parameters
+    ----------
+    usespectra : {'negative', 'positive'}, optional
+        Select which side of the measured spectrum is used to construct
+        the symmetrized spectrum. Default is 'negative'.
+
+    yscale : str, optional
+        Scale used for the y-axis in the diagnostic plots.
+        Default is 'log'.
+
+    xlim : tuple, optional
+        Limits of the energy-transfer axis in the plots.
+        Default is (-0.25, 0.25) meV.
+
+    ylim : tuple or None, optional
+        Limits of the y-axis.
+
+    showplot : bool, optional
+        If False, close the generated plot after creation.
+        Default is True.
+
+    saveplot : bool, optional
+        If True, save the comparison plot to disk.
+        Default is False.
+    """
         inches_to_cm = 2.54
         figsize = (20 / inches_to_cm, 18 / inches_to_cm)
         plt.rcParams.update({'font.size': 14})
-        
-        j0 = int(np.where(self.omeganew<=0)[0][-1])
 
-        if usespectra == 'negative':
-            omegaminus = self.omeganew[self.omeganew<=0]
-            omegaplus = abs(np.delete(omegaminus,-1)[::-1])
-            self.omegasym = np.concatenate((omegaminus,omegaplus),axis=0)
-            self.Nomegasym = len(self.omegasym)
-            
-            kb = const.Boltzmann #m^2 kg s^-2 K^-1=J/K
-            hbar = const.hbar # m^2 kg s^-1 =J*s
-            converter= 1/(1.602e-19) #eV/J
-            weightminus = np.exp(abs(omegaminus)/(kb*self.T*2*(converter)*(10**3)))
-            max_weightminus = max(weightminus)
-            
-            sqwsym = np.zeros((self.NQ,self.Nomegasym))
-            sqwerrorsym = np.zeros((self.NQ,self.Nomegasym))
-            vana_sqwsym = np.zeros((self.NQ,self.Nomegasym))
-            vana_sqwerrorsym = np.zeros((self.NQ,self.Nomegasym))
+        kb = const.Boltzmann
+        converter = 1 / (1.602e-19)
 
-            for i in range(self.NQ):
+        self.omegasym = []
+        self.sqwsymcorrnorm = []
+        self.sqwerrorsymcorrnorm = []
+        self.vana_sqwsymcorrnorm = []
+        self.vana_sqwerrorsymcorrnorm = []
+
+        sqwsym_list, sqwerrsym_list = [], []
+        vana_sqwsym_list, vana_errsym_list = [], []
+        for i in range(self.NQ):
+            w = self.omeganew[i]
+            j0 = int(np.where(w <= 0)[0][-1])
+
+            if usespectra == 'negative':
+                omegaminus = w[w <= 0]
+                omegaplus = np.abs(np.delete(omegaminus, -1)[::-1])
+                omegasym_i = np.concatenate((omegaminus, omegaplus))
+                weightminus = np.exp(np.abs(omegaminus) / (kb * self.T * 2 * converter * 1e3))
+
                 sqwnew = self.sqw[i][::self.index]
-                sqwminus = sqwnew[:j0+1] * weightminus
-                sqwplus = abs(np.delete(sqwminus, -1)[::-1])
-                sqwsym[i] = np.concatenate((sqwminus, sqwplus), axis=0)
-                
-                sqwerrornew = self.sqwerror[i][::self.index]
-                sqwerrorminus = sqwerrornew[:j0+1] * weightminus
-                sqwerrorplus = abs(np.delete(sqwerrorminus, -1)[::-1])
-                sqwerrorsym[i] = np.concatenate((sqwerrorminus, sqwerrorplus), axis=0)
-                
-                vana_sqwnew = self.vana_sqw[i][::self.index]
-                vana_sqwminus = vana_sqwnew[:j0+1] * weightminus
-                vana_sqwplus = abs(np.delete(vana_sqwminus, -1)[::-1])
-                vana_sqwsym[i] = np.concatenate((vana_sqwminus, vana_sqwplus), axis=0)
-                
-                vana_sqwerrornew = self.vana_sqwerror[i][::self.index]
-                vana_sqwerrorminus = vana_sqwerrornew[:j0+1] * weightminus
-                vana_sqwerrorplus = abs(np.delete(vana_sqwerrorminus, -1)[::-1])
-                vana_sqwerrorsym[i] = np.concatenate((vana_sqwerrorminus, vana_sqwerrorplus), axis=0)
+                sqwminus = sqwnew[:j0 + 1] * weightminus
+                sqwplus = np.abs(np.delete(sqwminus, -1)[::-1])
+                sqwsym = np.concatenate((sqwminus, sqwplus))
 
-        elif usespectra == 'positive':
-            omegaplus = self.omeganew[self.omeganew>=0]
-            omegaminus = -np.delete(omegaplus, 0)[::-1]
-            self.omegasym = np.concatenate((omegaminus, omegaplus), axis=0)
-            self.Nomegasym = len(self.omegasym)
-            
-            kb = const.Boltzmann  # m^2 kg s^-2 K^-1 = J/K
-            hbar = const.hbar  # m^2 kg s^-1 = J*s
-            converter = 1 / (1.602e-19)  # eV/J
-            weightplus = np.exp(-omegaplus / (kb * self.T * 2 * converter * 10**3))
-            max_weightplus = max(weightplus)
-            
-            sqwsym = np.zeros((self.NQ, self.Nomegasym))
-            sqwerrorsym = np.zeros((self.NQ, self.Nomegasym))
-            vana_sqwsym = np.zeros((self.NQ, self.Nomegasym))
-            vana_sqwerrorsym = np.zeros((self.NQ, self.Nomegasym))
-            
-            for i in range(self.NQ):
-                sqwerrornew = self.sqwerror[i][::self.index]
+                sqwerrnew = self.sqwerror[i][::self.index]
+                sqwerrminus = sqwerrnew[:j0 + 1] * weightminus
+                sqwerrplus = np.abs(np.delete(sqwerrminus, -1)[::-1])
+                sqwerrsym = np.concatenate((sqwerrminus, sqwerrplus))
+
+                vana_new = self.vana_sqw[i][::self.index]
+                vana_minus = vana_new[:j0 + 1] * weightminus
+                vana_plus = np.abs(np.delete(vana_minus, -1)[::-1])
+                vana_sym = np.concatenate((vana_minus, vana_plus))
+
+                vana_err_new = self.vana_sqwerror[i][::self.index]
+                vana_err_minus = vana_err_new[:j0 + 1] * weightminus
+                vana_err_plus = np.abs(np.delete(vana_err_minus, -1)[::-1])
+                vana_err_sym = np.concatenate((vana_err_minus, vana_err_plus))
+
+            elif usespectra == 'positive':
+                omegaplus = w[w >= 0]
+                omegaminus = -np.delete(omegaplus, 0)[::-1]
+                omegasym_i = np.concatenate((omegaminus, omegaplus))
+                weightplus = np.exp(-omegaplus / (kb * self.T * 2 * converter * 1e3))
+
                 sqwnew = self.sqw[i][::self.index]
                 sqwplus = sqwnew[j0:] * weightplus
-                sqwminus = abs(np.delete(sqwplus, 0)[::-1])
-                sqwsym[i] = np.concatenate((sqwminus, sqwplus), axis=0)
-                
-                #sqwerrornew = self.sqwerror[i][::self.index]
-                sqwerrorplus = sqwerrornew[j0:] * weightplus
-                sqwerrorminus = abs(np.delete(sqwerrorplus, 0)[::-1])
-                sqwerrorsym[i] = np.concatenate((sqwerrorminus, sqwerrorplus), axis=0)
-                
-                vana_sqwnew = self.vana_sqw[i][::self.index]
-                vana_sqwplus = vana_sqwnew[j0:] * weightplus
-                vana_sqwminus = abs(np.delete(vana_sqwplus, 0)[::-1])
-                vana_sqwsym[i] = np.concatenate((vana_sqwminus, vana_sqwplus), axis=0)
+                sqwminus = np.abs(np.delete(sqwplus, 0)[::-1])
+                sqwsym = np.concatenate((sqwminus, sqwplus))
 
-                vana_sqwerrornew = self.vana_sqwerror[i][::self.index]
-                vana_sqwerrorplus = vana_sqwerrornew[j0:] * weightplus
-                vana_sqwerrorminus = abs(np.delete(vana_sqwerrorplus, 0)[::-1])
-                vana_sqwerrorsym[i] = np.concatenate((vana_sqwerrorminus, vana_sqwerrorplus), axis=0)
+                sqwerrnew = self.sqwerror[i][::self.index]
+                sqwerrplus = sqwerrnew[j0:] * weightplus
+                sqwerrminus = np.abs(np.delete(sqwerrplus, 0)[::-1])
+                sqwerrsym = np.concatenate((sqwerrminus, sqwerrplus))
 
-        vana_Qintensity = sp.integrate.simpson(vana_sqwsym, self.omegasym)
-        vana_Qintensitymean = np.mean(vana_Qintensity)
-        CorrFactorQ = vana_Qintensitymean/vana_Qintensity
-        #print(CorrFactorQ)
+                vana_new = self.vana_sqw[i][::self.index]
+                vana_plus = vana_new[j0:] * weightplus
+                vana_minus = np.abs(np.delete(vana_plus, 0)[::-1])
+                vana_sym = np.concatenate((vana_minus, vana_plus))
 
-        sqwsymcorr = np.zeros((self.NQ,self.Nomegasym))
-        sqwerrorsymcorr = np.zeros((self.NQ,self.Nomegasym))
-        vana_sqwsymcorr = np.zeros((self.NQ,self.Nomegasym))
-        vana_sqwerrorsymcorr = np.zeros((self.NQ,self.Nomegasym))
-        for i in range(self.NQ):
-            sqwsymcorr[i] = sqwsym[i]*CorrFactorQ[i]
-            sqwerrorsymcorr[i] = sqwerrorsym[i]*CorrFactorQ[i]
-    
-            vana_sqwsymcorr[i] = vana_sqwsym[i]*CorrFactorQ[i]
-            vana_sqwerrorsymcorr[i] = vana_sqwerrorsym[i]*CorrFactorQ[i]
-    
-        # The frequency normalization
-        intg = sp.integrate.simpson(sqwsymcorr, self.omegasym)
-        vana_intg = sp.integrate.simpson(vana_sqwsymcorr, self.omegasym)
-        self.sqwsymcorrnorm = np.zeros((self.NQ,self.Nomegasym))
-        self.sqwerrorsymcorrnorm = np.zeros((self.NQ,self.Nomegasym))
-        self.vana_sqwsymcorrnorm = np.zeros((self.NQ,self.Nomegasym))
-        self.vana_sqwerrorsymcorrnorm = np.zeros((self.NQ,self.Nomegasym))
+                vana_err_new = self.vana_sqwerror[i][::self.index]
+                vana_err_plus = vana_err_new[j0:] * weightplus
+                vana_err_minus = np.abs(np.delete(vana_err_plus, 0)[::-1])
+                vana_err_sym = np.concatenate((vana_err_minus, vana_err_plus))
+            else:
+                raise ValueError(f"Usespectra must be 'negative' or 'positive'")
+
+            self.omegasym.append(omegasym_i)
+            sqwsym_list.append(sqwsym)
+            sqwerrsym_list.append(sqwerrsym)
+            vana_sqwsym_list.append(vana_sym)
+            vana_errsym_list.append(vana_err_sym)
+
+        # Q-normalization using vanadium intensity per Q
+        vana_int = [sp.integrate.simpson(vana_sqwsym_list[i], self.omegasym[i]) for i in range(self.NQ)]
+        mean_int = float(np.mean(vana_int))
+        corr = [mean_int / v for v in vana_int]
 
         for i in range(self.NQ):
-            self.sqwsymcorrnorm[i] = sqwsymcorr[i]/intg[i]
-            self.sqwerrorsymcorrnorm[i] = sqwerrorsymcorr[i]/intg[i]
+            sqw_corr = sqwsym_list[i] * corr[i]
+            sqwerr_corr = sqwerrsym_list[i] * corr[i]
+            vana_corr = vana_sqwsym_list[i] * corr[i]
+            vanaerr_corr = vana_errsym_list[i] * corr[i]
 
-            self.vana_sqwsymcorrnorm[i] = vana_sqwsymcorr[i]/vana_intg[i]
-            self.vana_sqwerrorsymcorrnorm[i] = vana_sqwerrorsymcorr[i]/vana_intg[i]
-        row = int(np.ceil(self.NQ/2))
-        
-        # Plotting
-        row = int(np.ceil(self.NQ / 2))
-        fig3, ax3 = plt.subplots(nrows=row, ncols=2, figsize=(figsize[0]*2, figsize[1]*row))
+            # frequency normalization per Q
+            intg = sp.integrate.simpson(sqw_corr, self.omegasym[i])
+            intg_v = sp.integrate.simpson(vana_corr, self.omegasym[i])
+
+            self.sqwsymcorrnorm.append(sqw_corr / intg)
+            self.sqwerrorsymcorrnorm.append(sqwerr_corr / intg)
+            self.vana_sqwsymcorrnorm.append(vana_corr / intg_v)
+            self.vana_sqwerrorsymcorrnorm.append(vanaerr_corr / intg_v)
+
+        # plotting (simple grid)
+        cols = 2
+        rows = int(np.ceil(self.NQ / cols))
+        fig3, axes = plt.subplots(rows, cols, figsize=(figsize[0]*2, figsize[1]*rows))
         fig3.suptitle(f'{self.filename} and vanadium comparison for different Q', x=0.5, y=0.92, fontsize=30)
-        
+        axes = np.atleast_2d(axes)
         for i in range(self.NQ):
-            row_idx = i // 2
-            col_idx = i % 2
-            ax3[row_idx, col_idx].errorbar(self.omegasym, self.sqwsymcorrnorm[i], color='b', fmt='.', capsize=3, label='QENS Data')
-            ax3[row_idx, col_idx].errorbar(self.omegasym, self.vana_sqwsymcorrnorm[i], color='r', fmt='-', capsize=3, label='Vanadium')
-            ax3[row_idx, col_idx].set(yscale=yscale, xlim=xlim, ylim=ylim, title=f'Q={self.Q[i]}$Å^{{-1}}$', ylabel='S(Q,ω)', xlabel='Energy (meV)')
-            ax3[row_idx, col_idx].legend(loc='best', prop={'size': 12})
-        
+            r, c = divmod(i, cols)
+            ax = axes[r, c]
+            ax.errorbar(self.omegasym[i], self.sqwsymcorrnorm[i], yerr = self.sqwerrorsymcorrnorm[i], fmt='.', ecolor = '#9d9e9d',capsize=3, label='QENS Data')
+            ax.errorbar(self.omegasym[i], self.vana_sqwsymcorrnorm[i], fmt='-', capsize=3, label='Vanadium')
+            ax.set(yscale=yscale, xlim=xlim, ylim=ylim, title=f'Q={self.Q[i]}$Å^{{-1}}$', ylabel='S(Q,ω)', xlabel='Energy (meV)')
+            ax.legend(loc='best', prop={'size': 12})
+        # hide unused axes
+        for j in range(self.NQ, rows*cols):
+            r, c = divmod(j, cols)
+            axes[r, c].axis('off')
+
         if not showplot:
             plt.close(fig3)
         if saveplot:
-            fig3.savefig(f'{self.filename}_vanadium_comparison.png', dpi=600)
+            fig3.savefig(f'{self.filename}_vanadium_comparison.png', dpi=600) 
 
     def Deconvolve(self, error='linear', showplot=True, saveplot=False):
         """
-         Compute and deconvolve the intermediate scattering function
+    Transform the normalized S(Q, ω) spectra into the time domain and
+    deconvolve the instrumental resolution using the vanadium spectrum.
 
-        Prameters
-        ----------
-            error : string, optional
-                A string setting the estimation of the uncertnaties. 
-                Currently two estimations are avaivable, 'gauss' and 'linear. Default is 'gauss'.
-            showplot : bool, optional
-                If 'True', all plots are shown. Default is 'True'
-            saveplot : bool, optional
-                If 'True', all shown plots are saved as png-files. Default is 'False'.
-        """
-        
-        # Figsize
+    For each Q-value, the symmetrized sample and vanadium spectra are
+    reordered into FFT-compatible form and transformed using an inverse
+    Fourier transform.
+
+    The resulting sample intermediate scattering function F(Q,t) is divided
+    by the Fourier-transformed vanadium spectrum, which acts as the
+    instrumental time window.
+
+    Different uncertainty propagation methods can be selected using the
+    `error` parameter.
+
+    Parameters
+    ----------
+    error : {'gauss', 'linear', 'pydynamic'}, optional
+        Method used to estimate uncertainties in the time domain.
+
+        'gauss'
+            Uses the transformed spectral uncertainties with an approximate
+            Gaussian scaling.
+
+        'linear'
+            Uses a linear estimate based on the quadrature sum of the
+            uncertainties in the frequency domain.
+
+        'pydynamic'
+            Uses covariance propagation through the discrete Fourier
+            transform using PyDynamic's GUM_DFT routine.
+
+        Default is 'linear'.
+
+    showplot : bool, optional
+        If False, close the generated figures after creation.
+        Default is True.
+
+    saveplot : bool, optional
+        If True, save the convolved and deconvolved figures.
+        Default is False.
+    """
         inches_to_cm = 2.54
         figsize = (20/inches_to_cm, 18/inches_to_cm)
         plt.rcParams.update({'font.size': 14})
 
-        self.Nomegasym= len(self.omegasym)
-        self.j0 = int(np.where(self.omegasym<=0)[0][-1])
-        
-        hbar = const.hbar # m^2 kg s^-1 =J*s
-        converter= 1/(1.602e-19) #eV/J
+        hbar = const.hbar
+        converter = 1/(1.602e-19)
 
-        # prepares for the Fourier transformation
-        # The following steps periodice S(Q,omega) by creating a periodic index
-        deltaomega = self.omegasym[self.j0+1]-self.omegasym[self.j0] # d(omega) for FT
-        domega = (deltaomega/(hbar*(converter)*(10**3)))*10**-12 #THz
-        dtime = 2*np.pi/(self.Nomegasym*domega) # ps
-        IndexFFT= (np.arange(0,self.Nomegasym)+self.j0)%self.Nomegasym
-        self.TimeAxis = (IndexFFT-self.j0)*dtime
-        
-        # Periodices S(Q,omega) and define the uncertanty
-        forfft = np.zeros((self.NQ,self.Nomegasym))
-        vana_forfft = np.zeros((self.NQ,self.Nomegasym))
-        
-        fqterror = np.ones((self.NQ,self.Nomegasym))
-        TimeWindow_error = np.ones((self.NQ,self.Nomegasym))
+        self.TimeAxis = []
+        self.TimeWindow = []
+        self.fqtdecon_norm = []
+        self.fqterrordecon_norm = []
 
         for i in range(self.NQ):
-            forfft[i] = self.sqwsymcorrnorm[i][IndexFFT]
-            vana_forfft[i] = self.vana_sqwsymcorrnorm[i][IndexFFT]
-            
-            # Assuming the errors are Gaussian distributed! 
-            # The width of the Gaussian is inverse when fourier transformed
+            w = self.omegasym[i]
+            j0 = int(np.where(w <= 0)[0][-1])
+
+            deltaomega = w[j0+1] - w[j0]
+            domega = (deltaomega / (hbar * converter * 1e3)) # THz
+            Nw = len(w)
+            IndexFFT = (np.arange(Nw) + j0) % Nw
+            dtime = 2*np.pi / (Nw * domega)
+            time_axis = (np.arange(Nw)) * dtime
+            self.TimeAxis.append(time_axis * (10**12))
+
+            sqw_i  = self.sqwsymcorrnorm[i][IndexFFT]
+            vana_i = self.vana_sqwsymcorrnorm[i][IndexFFT]
+
+            # Assuming the errors are Gaussian distributed!
+            # The width of the Gaussian is inverse when Fourier transformed
             if error == 'gauss':
-                fqterror[i] = self.sqwerrorsymcorrnorm[i][IndexFFT]*1e-1
-                TimeWindow_error[i] =self.vana_sqwerrorsymcorrnorm[i][IndexFFT]*1e-1
-            # Assuming linear estimation of the uncertanties
+                fqterror = self.sqwerrorsymcorrnorm[i][IndexFFT] * 1e-1
+                TimeWindow_error = self.vana_sqwerrorsymcorrnorm[i][IndexFFT] * 1e-1
+
+            # Assuming linear estimation of the uncertainties
             elif error == 'linear':
-                fqterror[i] = fqterror[i]*np.sqrt(np.sum(self.sqwerrorsymcorrnorm[i]**2))*deltaomega
-                TimeWindow_error[i] = TimeWindow_error[i]*np.sqrt(np.sum(self.vana_sqwerrorsymcorrnorm[i]**2))*deltaomega
-                
+                fqterror = np.sqrt(np.sum(self.sqwerrorsymcorrnorm[i]**2)) * deltaomega
+                TimeWindow_error = np.sqrt(np.sum(self.vana_sqwerrorsymcorrnorm[i]**2)) * deltaomega
+
             elif error == 'pydynamic':
                 signal = self.sqwsymcorrnorm[i][IndexFFT]
                 signal_error = self.sqwerrorsymcorrnorm[i][IndexFFT]
-
                 vana_signal = self.vana_sqwsymcorrnorm[i][IndexFFT]
                 vana_signal_error = self.vana_sqwerrorsymcorrnorm[i][IndexFFT]
 
-                # Get covariance matrices from GUM DFT (assumed to return full complex covariance matrix)
+                # Get covariance matrices from GUM DFT
                 _, Ufqt = GUM_DFT(signal, signal_error**2)
                 _, Uvana_fqt = GUM_DFT(vana_signal, vana_signal_error**2)
 
                 N = len(IndexFFT)
+
                 Ufqt = Ufqt[:N, :N]
                 Uvana_fqt = Uvana_fqt[:N, :N]
-
                 F_inv = np.fft.ifft(np.eye(N))
+
                 cov_fqt_time = F_inv @ Ufqt @ F_inv.conj().T
                 cov_vana_time = F_inv @ Uvana_fqt @ F_inv.conj().T
 
-                # Extract variance of real parts (since we use np.real(np.fft.ifft(...)) in fqt calculation)
-                fqterror[i] = np.sqrt(np.real(np.diag(cov_fqt_time))) * deltaomega * self.Nomegasym
-                TimeWindow_error[i] = np.sqrt(np.real(np.diag(cov_vana_time))) * deltaomega * self.Nomegasym
+                fqterror = (
+                    np.sqrt(np.real(np.diag(cov_fqt_time)))
+                    * deltaomega
+                    * Nw
+                )
+                TimeWindow_error = (
+                    np.sqrt(np.real(np.diag(cov_vana_time)))
+                    * deltaomega
+                    * Nw
+                )
 
-        # Compute the intermediate scattering function F(Q,t) and 
-        # deconvolve it by using the Inverse Fouriertransform for the
-        # vanadium  
-        fqt = deltaomega *np.real(np.fft.ifft(forfft))*self.Nomegasym
-        self.TimeWindow = deltaomega *np.real(np.fft.ifft(vana_forfft))*self.Nomegasym
-        fqtdecon = fqt/self.TimeWindow
-        fqterrordecon = np.sqrt((fqterror/self.TimeWindow)**2+((fqtdecon*TimeWindow_error)/self.TimeWindow**2)**2)
-        # scale the fqt
-        self.fqtdecon_norm = np.zeros((self.NQ,self.Nomegasym))
-        self.fqterrordecon_norm = np.zeros((self.NQ,self.Nomegasym))
-        for i in range(self.NQ):
-            self.fqtdecon_norm[i] = fqtdecon[i] /fqtdecon[i][0]
-            self.fqterrordecon_norm[i] = fqterrordecon[i] /fqtdecon[i][0] 
-        row = int(np.ceil(self.NQ/2))
-        fig4, ax4 = plt.subplots(nrows=row, ncols=2, figsize=(figsize[0]*2,figsize[1]*row))
-        fig4.suptitle(self.filename+'Convolved',x=0.5,y=0.92, fontsize = 30)
-        fig5, ax5 = plt.subplots(nrows=row, ncols=2, figsize=(figsize[0]*2,figsize[1]*row))
-        fig5.suptitle(self.filename+'Deconvolved',x=0.5,y=0.92, fontsize = 30)
-        for i in range(self.NQ):
-            row1 = (row-1)
-            #print(np.max(fqt[i]))
-            if i<=row1:
-                ax4[i][0].plot(fqt[i],'b.', label='Q='+str(self.Q[i])+r'$Å^{-1}$')
-                ax4[i][0].set(ylim=(-0.1,1.1), title = self.filename+' Convolved', ylabel = f'F(Q,t)', xlabel = 'Measurement number')
-                ax4[i][0].legend(loc='best', prop = {'size':12})
             else:
-                ax4[(row1-i)][1].plot(fqt[i],'b.', label='Q='+str(self.Q[i])+r'$Å^{-1}$')
-                ax4[(row1-i)][1].set(ylim=(-0.1,1.1), title = self.filename+' Convolved', ylabel = f'F(Q,t)', xlabel = 'Measurement number')
-                ax4[(row1-i)][1].legend(loc ='best', prop = {'size':12})
-            if i<=row1:
-                ax5[i][0].plot(self.fqtdecon_norm[i],'b.', label='Q='+str(self.Q[i])+r'$Å^{-1}$')
-                ax5[i][0].set(ylim=(-4,4), title = self.filename+' Deconvolved', ylabel = f'F(Q,t)', xlabel = 'Measurement number')
-                ax5[i][0].legend(loc='best', prop = {'size':12})
-            else:
-                ax5[(row1-i)][1].plot(self.fqtdecon_norm[i],'b.', label='Q='+str(self.Q[i])+r'$Å^{-1}$')
-                ax5[(row1-i)][1].set(ylim=(-4,4), title = self.filename+' Deconvolved', ylabel = f'F(Q,t)', xlabel = 'Measurement number')
-                ax5[(row1-i)][1].legend(loc ='best', prop = {'size':12})
+                raise ValueError("Unknown error model. Must be 'gauss', 'linear' or 'pydynamic'")
+
+            fqt = deltaomega * np.real(np.fft.ifft(sqw_i)) * Nw
+
+            timewin = deltaomega * np.real(np.fft.ifft(vana_i)) * Nw
+
+            fqtdecon = fqt / timewin
+
+            fqterrordecon = np.sqrt(
+                (fqterror / timewin)**2
+                +
+                ((fqtdecon * TimeWindow_error) / timewin)**2
+            )
+
+            # normalize by first point
+            scale = fqtdecon[0]
+            self.TimeWindow.append(timewin)
+            self.fqtdecon_norm.append(fqtdecon / scale)
+            self.fqterrordecon_norm.append(fqterrordecon / scale)
+
+        # plotting the convolved F(Q,t)
+        cols = 2
+        rows = int(np.ceil(self.NQ / cols))
+
+        fig_conv, axes_conv = plt.subplots(rows,cols,figsize=(figsize[0]*2, figsize[1]*rows))
+        fig_conv.suptitle(f'{self.filename} Convolved F(Q,t) for different Q',x=0.5,y=0.92,fontsize=30)
+        axes_conv = np.atleast_2d(axes_conv)
+
+        for i in range(self.NQ):
+            r, c = divmod(i, cols)
+            ax = axes_conv[r, c]
+            t_i = self.TimeAxis[i]
+            ax.plot(t_i,self.TimeWindow[i],'.',label='Convolved')
+            ax.set(xlabel='Time (ps)',ylabel='F(Q,t)',ylim=(-0.1, 1.1),title=f'Q={self.Q[i]} $Å^{{-1}}$')
+            ax.legend(loc='best', prop={'size': 12})
+            
+        for j in range(self.NQ, rows*cols):
+            r, c = divmod(j, cols)
+            axes_conv[r, c].axis('off')
+
+        # Plotting the deconvolved F(Q,t)
+        fig_deconv, axes_deconv = plt.subplots(rows,cols,figsize=(figsize[0]*2, figsize[1]*rows))
+        fig_deconv.suptitle(f'{self.filename} Deconvolved F(Q,t) for different Q',x=0.5,y=0.92,fontsize=30)
+
+        axes_deconv = np.atleast_2d(axes_deconv)
+
+        for i in range(self.NQ):
+            r, c = divmod(i, cols)
+            ax = axes_deconv[r, c]
+            t_i = self.TimeAxis[i]
+            y_i = self.fqtdecon_norm[i]
+            yerr_i = self.fqterrordecon_norm[i]
+
+            ax.errorbar(t_i,y_i,yerr=yerr_i,fmt='.',ecolor = '#9d9e9d',capsize=3,label='Deconvolved')
+            ax.set(xlabel='Time (ps)',ylabel='F(Q,t)',ylim=(-0.2, 1.2),title=f'Q={self.Q[i]} $Å^{{-1}}$')
+            ax.legend(loc='best', prop={'size': 12})
+
+        for j in range(self.NQ, rows*cols):
+            r, c = divmod(j, cols)
+            axes_deconv[r, c].axis('off')
+
         if not showplot:
-            plt.close(fig4)
-            plt.close(fig5)
-        if saveplot:
-            fig4.savefig('./figure/'+self.filename+'convolved.png', dpi=600)
-            fig5.savefig('./figure/'+self.filename+'deconvolved.png', dpi=600)
-    
-    def Fitting(self, N_cut = 20, algo = 'iminuit', p0=[5,0.1,0.1], useerror=False, showplot = True, saveplot = False):
-        """
-        Fitting the simple model to the intermediate scattering function
+            plt.close(fig_conv)
+            plt.close(fig_deconv)
 
-        Parameters
-        ----------
-            N_cut : int
-                A int setting the number of measurements used in the fit
-                 A string containing the name of the measured sample.
-            p0 : list, optional
-                A 3 element list [tau0,alpha0,eisf0] containing the initial geuss for the fit parameters.
-            useerror : bool, optional
-                If 'True', the uncertainties are used in the fit. Default is 'False'.
-            showplot : bool, optional
-                If 'True', all plots are shown. Default is 'True'
-            saveplot : bool, optional
-                If 'True', all shown plots are saved as png-files. Default is 'False'.
+        if saveplot:
+            fig_conv.savefig(f'./figure/{self.filename}_convolved.png',dpi=600)
+            fig_deconv.savefig(f'./figure/{self.filename}_deconvolved.png',dpi=600)
+
+    def Fitting(self, N_cut=20, model = 'ml', algo='iminuit', p0=[9,0.1,0.1], useerror=False,
+            showplot=True, saveplot=False):
+        """
+    Fit the deconvolved intermediate scattering function F(Q,t)
+    for each Q-value.
+
+    The function fits either a Mittag-Leffler ('ml') or stretched
+    exponential ('se') to the deconvolved and normalized
+    F(Q,t) data.
+
+    Two fitting algorithms are available:
+
+        - iminuit
+        - scipy.curve_fit
+
+    The fitted parameters are stored as functions of Q and include the
+    characteristic relaxation time, stretching exponent,
+    and elastic incoherent structure factor (EISF).
+
+    Parameters
+    ----------
+    N_cut : int or array-like, optional
+        Number of time points included in the fit.
+
+        If an integer is supplied, the same number of points is used
+        for every Q-value.
+
+        If an array-like object is supplied, it must contain one value
+        for each Q-point, allowing a different fitting range for each Q.
+
+        Default is 20.
+
+    model : {'ml', 'se'}, optional
+        Relaxation model used for fitting.
+
+        'ml'
+            Mittag-Leffler model.
+
+        'se'
+            Stretched exponential model.
+
+        Default is 'ml'.
+
+    algo : {'iminuit', 'scipy.curve_fit'}, optional
+        Numerical fitting algorithm.
+
+        Default is 'iminuit'.
+
+    p0 : array-like, optional
+        Initial parameter estimates in the order:
+
+            [tau, alpha, eisf]
+
+        For the stretched exponential model, the parameter stored as
+        `alpha` represents the stretching exponent beta.
+        Default is [9, 0.1, 0.1].
+
+    useerror : bool, optional
+        If True, include the propagated F(Q,t) uncertainties in the fit.
+        If False, all fitted points are effectively treated with equal
+        weighting.
+        Default is False.
+
+    showplot : bool, optional
+        If False, close the generated figures after fitting.
+        Default is True.
+
+    saveplot : bool, optional
+        If True, save the fit and parameter-summary figures.
+        Default is False.
     """
 
-        # Figsize
         inches_to_cm = 2.54
         figsize = (20/inches_to_cm, 18/inches_to_cm)
         plt.rcParams.update({'font.size': 14})
 
-        hbar = const.hbar # m^2 kg s^-1 =J*s
-        converter= 1/(1.602e-19) #eV/J
+        self.model = model
+        if self.model == 'ml':
+            fqt_model = fqt_model1
 
-        # The fit is done for all Q-values and plotted together
-        # with the fit parameters and the chisquare value and p-value
-        row = int(np.ceil(self.NQ/2))
-        fig12, ax12 = plt.subplots(nrows=row, ncols=2, figsize=(figsize[0]*2,figsize[1]*row))
-        fig12.suptitle(self.filename+ ' ' + algo + ' fit',x=0.5,y=0.92, fontsize = 30)
-    
-        self.tau, self.etau =  np.zeros((self.NQ)), np.zeros((self.NQ))
-        self.alpha, self.ealpha = np.zeros((self.NQ)), np.zeros((self.NQ))
-        self.eisf, self.eeisf = np.zeros((self.NQ)), np.zeros((self.NQ))
+        elif self.model == 'se':
+            fqt_model = fqt_model2
+        else:
+            raise ValueError("Unknown model. Must be 'ml' or 'se'")
+
+        self.tau, self.etau = np.zeros(self.NQ), np.zeros(self.NQ)
+        self.alpha, self.ealpha = np.zeros(self.NQ), np.zeros(self.NQ)
+        self.eisf, self.eeisf = np.zeros(self.NQ), np.zeros(self.NQ)
+
+        cols = 2
+        rows = int(np.ceil(self.NQ / cols))
+
+        fig12, axes = plt.subplots(rows,cols,figsize=(figsize[0]*2, figsize[1]*rows))
+        fig12.suptitle(f'{self.filename} {algo} fit for different Q', x=0.5, y=0.92, fontsize=30)
+        axes = np.atleast_2d(axes)
 
         for i in range(self.NQ):
-            tmax = self.TimeAxis[N_cut]
-            fqtforfit = (self.fqtdecon_norm[i][:N_cut])
-            fqtforfit_error = (self.fqterrordecon_norm[i][:N_cut])
-            timeforfit = (self.TimeAxis[:N_cut])
+            if isinstance(N_cut, int):
+                N_cut_i = min(N_cut, len(self.TimeAxis[i]))
+            else:
+                if len(N_cut) != self.NQ:
+                    raise ValueError("Length of N_cut array must match number of Q points")
 
+                N_cut_i = min(
+                    int(N_cut[i]),
+                    len(self.TimeAxis[i])
+                )
+
+            t = self.TimeAxis[i][:N_cut_i]
+            y = self.fqtdecon_norm[i][:N_cut_i]
+            yerr = self.fqterrordecon_norm[i][:N_cut_i]
+
+            # Fitting
             if algo == 'iminuit':
-                if useerror == True:
-                    Chi2_object = Chi2Regression(fqt_model,timeforfit ,fqtforfit,fqtforfit_error)
+
+                if useerror:
+                    Chi2_object = Chi2Regression(fqt_model,t,y,yerr)
                 else:
-                    Chi2_object = Chi2Regression(fqt_model,timeforfit ,fqtforfit)
+                    Chi2_object = Chi2Regression(fqt_model,t,y)
 
-                minuit = Minuit(Chi2_object, tau=p0[0],alpha=p0[1], eisf=p0[2])
-                minuit.limits['alpha']= (0.01,0.95)
-                minuit.limits['tau']= (0.01,1e4)
-                minuit.limits['eisf']= (0,0.95)
-                minuit.errordef = 1
-                minuit.migrad()         
-                
-                self.alpha[i] = minuit.values['alpha']
-                self.ealpha[i] = minuit.errors['alpha']
-                self.tau[i] = minuit.values['tau']
-                self.etau[i] = minuit.errors['tau']
-                self.eisf[i] = minuit.values['eisf'] 
-                self.eeisf[i] = minuit.errors['eisf']
+                m = Minuit(
+                    Chi2_object,
+                    tau=p0[0],
+                    alpha=p0[1],
+                    eisf=p0[2]
+                )
 
-                ndof = (len(timeforfit)-len(p0))
-                chi2, prob = minuit.fval, stats.chi2.sf(minuit.fval,ndof)
+                m.limits['alpha'] = (0.01, 0.95)
+                m.limits['tau'] = (0.01, 1e4)
+                m.limits['eisf'] = (0, 0.95)
+
+                m.errordef = 1
+                m.migrad()
+
+                self.alpha[i] = m.values['alpha']
+                self.ealpha[i] = m.errors['alpha']
+
+                self.tau[i] = m.values['tau']
+                self.etau[i] = m.errors['tau']
+
+                self.eisf[i] = m.values['eisf']
+                self.eeisf[i] = m.errors['eisf']
+
+                nparams = len(p0)
+                ndof = max(len(t) - nparams, 1)
+
+                chi2 = m.fval
+                prob = stats.chi2.sf(m.fval, ndof)
+
 
             elif algo == 'scipy.curve_fit':
-                bounds = ((0.01, 0.01, 0), (1e4, 0.95, 0.95))  # Bounds for tau, alpha and eisf
 
-                # Fit the data using curve_fit
-                if useerror == True:
-                    popt, pcov = curve_fit(fqt_model, timeforfit, fqtforfit, p0, sigma=fqtforfit_error, bounds=bounds)
+                bounds = (
+                    (0.01, 0.01, 0.0),
+                    (1e4, 0.95, 0.95)
+                )
+
+                if useerror:
+                    popt, pcov = curve_fit(fqt_model,t,y,p0,sigma=yerr,bounds=bounds,maxfev=10000)
                 else:
-                    popt, pcov = curve_fit(fqt_model, timeforfit, fqtforfit, p0, bounds=bounds)
+                    popt, pcov = curve_fit(fqt_model,t,y,p0,bounds=bounds,maxfev=10000)
 
-                # Extract optimized parameters
                 self.tau[i], self.alpha[i], self.eisf[i] = popt
-                
-                perr = np.sqrt(np.diag(pcov))  # Standard deviations from the covariance matrix
-                self.etau[i], self.ealpha[i], self.eeisf[i] = perr 
 
-                # Compute chi2 values
-                residuals = fqtforfit - fqt_model(timeforfit, *popt)
-                if useerror == True:
-                    chi2 = np.sum((residuals / fqtforfit_error) ** 2)
-                else: 
-                    chi2 = np.sum((residuals) ** 2)
-                ndof = len(fqtforfit) - len(popt)
+                perr = np.sqrt(np.diag(pcov))
+                self.etau[i], self.ealpha[i], self.eeisf[i] = perr
+                resid = y - fqt_model(t, *popt)
+                if useerror:
+                    chi2 = np.sum((resid / yerr)**2)
+                else:
+                    chi2 = np.sum(resid**2)
+
+                ndof = max(len(y) - len(popt), 1)
                 prob = stats.chi2.sf(chi2, ndof)
 
-            xaxis = abs(self.TimeAxis[:N_cut])
-            yaxis = fqt_model(xaxis,self.tau[i],self.alpha[i], self.eisf[i])
-        
-            d = {'tau': "{:.4f} +/- {:.4f}".format(self.tau[i],self.etau[i]),
-             'alpha': "{:.4f} +/- {:.4f}".format(self.alpha[i],self.ealpha[i]),
-             'eisf': "{:.4f} +/- {:.4f}".format(self.eisf[i],self.eeisf[i]),
-             "Chi2": "{:.2f}".format(chi2),
-             "Ndof": "{:.1f}".format(ndof),
-             "ProbChi2": "{:.3f}".format(prob),}
-            text = nice_string_output(d, extra_spacing=2, decimals=3)
-            row1 = (row-1)
-            if i<=row1:
-                add_text_to_ax(0.40, 0.80, text, ax12[i][0], fontsize=12)
-                ax12[i][0].errorbar(timeforfit, fqtforfit,fqtforfit_error, fmt='o', color = 'b',ecolor = 'k', capsize = 5, label =' Q='+str(self.Q[i])+r'$Å^{-1}$')
-                ax12[i][0].plot(xaxis, yaxis, 'r-', label='Fit')
-                ax12[i][0].set(xlabel ='t[ps]',ylabel='F(Q,t)')
-                ax12[i][0].legend(loc = 1, prop = {'size':12})
             else:
-                add_text_to_ax(0.40, 0.80, text, ax12[(row1-i)][1], fontsize=12)
-                ax12[(row1-i)][1].errorbar(timeforfit, fqtforfit,fqtforfit_error, fmt='o', color = 'b',ecolor = 'k', capsize = 5, label =' Q='+str(self.Q[i])+r'$Å^{-1}$')
-                ax12[(row1-i)][1].plot(xaxis, yaxis, 'r-', label='Fit)')
-                ax12[(row1-i)][1].set(xlabel ='t[ps]',ylabel='F(Q,t)')
-                ax12[(row1-i)][1].legend(loc = 1, prop = {'size':12})
-    
+                raise ValueError(
+                    "Unknown algo. Must be 'iminuit' or 'scipy.curve_fit'"
+                )
 
-        fig13, ax13 = plt.subplots(nrows=3, ncols=1, figsize=(figsize[0],figsize[1]*1.5), gridspec_kw = {'hspace':0.4})
-        fig13.suptitle(self.filename+'Fit parameters',x=0.5,y=0.99, fontsize = 30)
-        ax13[0].errorbar(self.Q, self.alpha, color ='b', fmt='o', label=self.filename)
-        ax13[0].set(xlabel='Q '+r'[$Å^{-1}$]',ylabel=r'$\alpha$',ylim=(0.0,1))
-        ax13[0].legend(loc = 3, prop = {'size':14})
-        ax13[1].errorbar(self.Q, self.eisf, color ='b', fmt='o', label=self.filename)
-        ax13[1].set(xlabel='Q '+r'[$Å^{-1}$]',ylabel=r'$EISF$',ylim=(-0.2,1))
-        ax13[1].legend(loc = 3, prop = {'size':14})
-        ax13[2].errorbar(self.Q, self.tau, color ='b', fmt='o', label=self.filename)
-        ax13[2].set(xlabel=r'Q $[Å^{-1}]$',ylabel=r'$\tau$ [ps]')
-        ax13[2].legend(loc = 3, prop = {'size':14})
+            # Plot the fitting of F(Q,t)
+            r, c = divmod(i, cols)
+            ax = axes[r, c]
 
-        self.fitparameters = [self.tau,self.alpha,self.eisf]
-        self.fitparameters_error = [self.etau,self.ealpha,self.eeisf]
-    
+            xfit = np.linspace(np.min(t),np.max(t),500)
+            yfit = fqt_model(np.abs(xfit),self.tau[i],self.alpha[i],self.eisf[i])
+            ax.errorbar(t,y,yerr=yerr,fmt='.',ecolor = '#9d9e9d',capsize=3,zorder=1,label='Data'
+        )
+
+            ax.plot(xfit,yfit,'-',color = 'red',linewidth=2,zorder=2,label='Fit')
+            ax.set(xlabel='Time (ps)',ylabel='F(Q,t)',title=f'Q={self.Q[i]} $Å^{{-1}}$')
+            ax.legend(loc='best',prop={'size': 12})
+
+            # parameter box
+            parameter_text = (
+                rf'$\tau$ = {self.tau[i]:.2f} $\pm$ {self.etau[i]:.2f} ps'
+                '\n'
+                rf'$\alpha$ = {self.alpha[i]:.3f} $\pm$ {self.ealpha[i]:.3f}'
+                '\n'
+                rf'EISF = {self.eisf[i]:.3f} $\pm$ {self.eeisf[i]:.3f}'
+                '\n'
+                rf'$\chi^2$/DOF = {chi2/ndof:.2f}'
+            )
+
+            ax.text(
+                0.97,
+                0.97,
+                parameter_text,
+                transform=ax.transAxes,
+                ha='right',
+                va='top',
+                fontsize=11,
+                bbox=dict(
+                    boxstyle='round',
+                    facecolor='white',
+                    alpha=0.8
+                )
+            )
+
+        # hide unused axes
+        for j in range(self.NQ, rows*cols):
+            r, c = divmod(j, cols)
+            axes[r, c].axis('off')
+      
+        # Plot of the fitted cuves
+        # =========================================================
+
+        fig13, ax13 = plt.subplots(3,1,figsize=(figsize[0]*1.35, figsize[1]*2.0),sharex=True)
+        fig13.suptitle(f'{self.filename} Fit parameters',x=0.5,y=0.97,fontsize=26)
+
+        # plotting the fit parameters
+        ax13[0].errorbar(self.Q,self.alpha,yerr= None,fmt='o',capsize=3,label=self.filename)
+        if self.model == 'ml':
+            ax13[0].set(
+                        ylabel=r'$\alpha$',
+                        ylim=(0.0, 1.0)
+                    )
+                
+        elif self.model == 'se':
+            ax13[0].set(
+                        ylabel=r'$\beta$',
+                        ylim=(0.0, 1.0)
+                    )
+
+        ax13[0].legend(loc='best',
+            prop={'size': 11}
+        )
+
+        # EISF
+        # ---------------------------------------------------------
+        ax13[1].errorbar(
+            self.Q,
+            self.eisf,
+            yerr= None,
+            fmt='o',
+            capsize=3,
+            label=self.filename
+        )
+
+        ax13[1].set(
+            ylabel='EISF',
+            ylim=(-0.05, 1.0)
+        )
+
+        ax13[1].legend(
+            loc='best',
+            prop={'size': 11}
+        )
+
+        # ---------------------------------------------------------
+        # tau
+        # ---------------------------------------------------------
+        ax13[2].errorbar(
+            self.Q,
+            self.tau,
+            yerr= None,
+            fmt='o',
+            capsize=3,
+            label=self.filename
+        )
+
+        ax13[2].set(
+            xlabel='Q [Å$^{-1}$]',
+            ylabel=r'$\tau$ [ps]'
+        )
+
+        ax13[2].legend(
+            loc='best',
+            prop={'size': 11}
+        )
+
+        # slightly cleaner spacing
+        fig13.subplots_adjust(
+            top=0.90,
+            hspace=0.12
+        )
+
+        # ---------------------------------------------------------
+        # Show / save
+        # ---------------------------------------------------------
         if not showplot:
             plt.close(fig12)
             plt.close(fig13)
+
         if saveplot:
-            fig12.savefig('./figure/'+self.filename+'fit.png', dpi=600)
-            fig13.savefig('./figure/'+self.filename+'fit_parameters.png', dpi=600)
-    
-    def Resample(self,yscale ='log',xlim=(-0.5,0.5),ylim=None ,showplot = True, saveplot = False):
-        """
-        Calculate the reduced chi2
 
-        Parameters
-        ----------
-            y_data : numpy.array
-                A 1D ``array`` of the measured data
-            y_fit : numpy.array
-                A 1D ``array`` of the fit of the measured data
-            sigmas : numpy.array
-                A 1D ``array`` of the uncertainties for the measured data
-        """
+            fig12.savefig(
+                f'./figure/{self.filename}_fit.png',
+                dpi=600,
+                bbox_inches='tight'
+            )
 
-        # Figsize
+            fig13.savefig(
+                f'./figure/{self.filename}_fit_parameters.png',
+                dpi=600,
+                bbox_inches='tight'
+            )
+
+    def Resample(self, yscale='log', xlim=(-0.5, 0.5), ylim=None,
+             showplot=True, saveplot=False):
+        """
+    Reconstruct the fitted time-domain relaxation model in the
+    energy domain and compare it directly with the measured S(Q, ω).
+
+    The fitted deconvolved F(Q,t) model is evaluated on the complete
+    FFT time grid. The normalization and instrumental resolution that
+    were removed during Deconvolve() are then reapplied.
+
+    The resulting convolved time-domain model is Fourier transformed
+    back into S(Q,ω), allowing direct comparison between the fitted
+    relaxation model and the experimental QENS spectrum.
+
+    Residuals and chi-square statistics are also calculated for each
+    Q-value.
+
+    Parameters
+    ----------
+    yscale : str, optional
+        Scale used for the S(Q,ω) y-axis.
+        Default is 'log'.
+
+    xlim : tuple or None, optional
+        Energy-transfer range shown in the plots and used for the
+        displayed chi-square calculation.
+
+        Default is (-0.5, 0.5) meV.
+
+    ylim : tuple or None, optional
+        Limits of the S(Q,ω) y-axis.
+        If None, matplotlib determines the limits automatically.
+
+    showplot : bool, optional
+        If False, close the generated figure after creation.
+        Default is True.
+
+    saveplot : bool, optional
+        If True, save the reconstructed-model comparison figure.
+        Default is False.
+    """
+
+    # Conversion factor used for defining figure dimensions
+    # in centimeters.               
         inches_to_cm = 2.54
         figsize = (20/inches_to_cm, 18/inches_to_cm)
         plt.rcParams.update({'font.size': 14})
-    
-        hbar = const.hbar # m^2 kg s^-1 =J*s
-        converter= 1/(1.602e-19) #eV/J
-    
-        #  Creating the time axis
-        deltaomega = self.omegasym[self.j0+1]-self.omegasym[self.j0]
-        domega = (deltaomega/(hbar*(converter)*(10**3)))*10**-12 #THz
-        dtime = 2*np.pi/(self.Nomegasym*domega) # ps # self. these
-        IndexFFT= (np.arange(0,self.Nomegasym)+self.j0)%self.Nomegasym
-        self.TimeAxis = (IndexFFT-self.j0)*dtime
-    
-        # Create the fitted model for F(Q,t)
-        time_fqtfitsampled = np.linspace(0,dtime*self.Nomegasym,self.Nomegasym)
-    
-        self.fqtfitsampled = np.zeros((self.NQ,self.Nomegasym))
-        fqtfitmodel = np.zeros((self.NQ,self.Nomegasym))
-        for i in range(self.NQ):
-            self.fqtfitsampled[i] = fqt_model(abs(self.TimeAxis),self.tau[i],self.alpha[i],self.eisf[i])
-            fqtfitmodel[i] = self.fqtfitsampled[i] * self.TimeWindow[i]
-    
-        # Create the fitted model for S(Q,omega)
-        tmp = (hbar*converter*1e3)/(dtime*1e-12)  #meV
-        factor = (1/tmp)*(1/(2*np.pi))
-        sqwfitmodelFFT = factor*np.real(np.fft.fft(fqtfitmodel))
-        InverseIndexFFT= (np.arange(0,self.Nomegasym)+(self.j0+1))%self.Nomegasym
-        # Compare the fitted model for S(Q,t) with the actual measured
-        # S(Q,t) for the sample
-    
-        self.sqwfitmodel = np.zeros((self.NQ,self.Nomegasym))
-        for i in range(self.NQ):
-            self.sqwfitmodel[i] = sqwfitmodelFFT[i][InverseIndexFFT]
-            if (i+1) % 2:
-                fig3, ax3 = plt.subplots(nrows=2, ncols=2, figsize=(15,5),
-                        gridspec_kw={'height_ratios':[4,1], 'hspace':0.03}, sharex=True)
-                ax3[0,0].errorbar(self.omegasym,self.sqwsymcorrnorm[i],yerr=self.sqwerrorsymcorrnorm[i] ,fmt='.',capsize=3,color='r',alpha=0.4, label = 'QENS Data')
-                ax3[0,0].errorbar(self.omegasym,self.sqwfitmodel[i],lw=4,color='k', label = 'Fitted model',zorder=1)
-                ax3[0,0].set(title='Q='+str(self.Q[i])+r'$Å^{-1}$',xlabel=r'$\hbar\omega$',ylabel=r'log(S($Q,\omega$))', yscale=yscale,xlim=xlim,ylim=ylim)
-                ax3[0,0].legend(loc=2,fontsize=12)
-                residuals = self.sqwfitmodel[i]-self.sqwsymcorrnorm[i]
-                ax3[1,0].errorbar(self.omegasym,residuals,yerr = self.sqwerrorsymcorrnorm[i],
-                      fmt='.',capsize=3,color='r',alpha=0.9,label='Residuals');  
-                ax3[1,0].plot(self.omegasym,np.zeros_like(self.omegasym),'k',lw=3);  
-                ax3[1,0].set(xlabel=r'$\hbar\omega$',ylabel=r'Residual',xlim=xlim)
-                ax3[1,0].legend(loc=4,fontsize=14)
-                if xlim == False:
-                    chi2_red, ndof, pval = calc_chi2(self.sqwsymcorrnorm[i],self.sqwfitmodel[i],
-                                           self.sqwerrorsymcorrnorm[i] )
-                else: 
-                    ind1 = int(np.where(self.omegasym>xlim[0])[0][0]-1)
-                    ind2 = int(np.where(self.omegasym>xlim[1])[0][0])
-                    chi2_red, ndof, pval = calc_chi2(self.sqwsymcorrnorm[i][ind1:ind2],self.sqwfitmodel[i][ind1:ind2],
-                                           self.sqwerrorsymcorrnorm[i][ind1:ind2] )
-                d = {r"$\chi^2$=":"{:.2f}".format(chi2_red),
-                     }
-                text = nice_string_output(d, extra_spacing=0, decimals=3)
-                add_text_to_ax(0.05, 0.7, text, ax3[0,0], fontsize=16)
+
+        if self.model == 'ml':
+            fqt_model = fqt_model1
         
+        elif self.model == 'se':
+            fqt_model = fqt_model2
+        hbar = const.hbar
+        converter = 1 / (1.602e-19)
+
+        if not hasattr(self, "TimeWindow"):
+            raise RuntimeError("Run Deconvolve() before Resample().")
+
+        if not all(hasattr(self, name) for name in ["tau", "alpha", "eisf"]):
+            raise RuntimeError("Run Fitting() before Resample().")
+
+        self.fqtfitsampled = []
+        self.fqtfitmodel_convolved = []
+        self.sqwfitmodel = []
+
+        # ---------------------------------------------------------
+        # Plotting scaffold
+        # Same 2-column style as Sym_Norm
+        # Each Q panel contains:
+        #   upper: data + fitted model
+        #   lower: residuals
+        # ---------------------------------------------------------
+        cols = 2
+        rows = int(np.ceil(self.NQ / cols))
+
+        fig3 = plt.figure(
+            figsize=(figsize[0]*2, figsize[1]*rows)
+        )
+
+        fig3.suptitle(
+            f'{self.filename} fitted model comparison for different Q',
+            x=0.5,
+            y=0.92,
+            fontsize=30
+        )
+
+        outer = fig3.add_gridspec(
+            rows,
+            cols,
+            hspace=0.35,
+            wspace=0.25
+        )
+
+        for i in range(self.NQ):
+
+            w = self.omegasym[i]
+            j0 = int(np.where(w <= 0)[0][-1])
+
+            deltaomega = w[j0 + 1] - w[j0]
+            Nw = len(w)
+
+            # Same FFT ordering as in Deconvolve()
+            IndexFFT = (np.arange(Nw) + j0) % Nw
+
+            # Same time spacing as in Deconvolve()
+            domega = deltaomega / (hbar * converter * 1e3)
+            dtime_s = 2 * np.pi / (Nw * domega)
+            dtime_ps = dtime_s * 1e12
+
+            # FFT time grid
+            n = np.arange(Nw)
+            t_eff_ps = np.minimum(n, Nw - n) * dtime_ps
+
+            # -----------------------------------------------------
+            # Fitted deconvolved normalized F(Q,t)
+            # -----------------------------------------------------
+            fqtfitsampled_i = fqt_model(
+                t_eff_ps,
+                self.tau[i],
+                self.alpha[i],
+                self.eisf[i]
+            )
+
+            # -----------------------------------------------------
+            # Reconstruct normalization scale from Deconvolve()
+            # -----------------------------------------------------
+            sqw_i = self.sqwsymcorrnorm[i][IndexFFT]
+            vana_i = self.vana_sqwsymcorrnorm[i][IndexFFT]
+
+            fqt0 = (
+                deltaomega
+                * np.real(np.fft.ifft(sqw_i))[0]
+                * Nw
+            )
+
+            timewin0 = (
+                deltaomega
+                * np.real(np.fft.ifft(vana_i))[0]
+                * Nw
+            )
+
+            scale = fqt0 / timewin0
+
+            # Reverse:
+            # fqtdecon_norm = (fqt / timewin) / scale
+            timewin_i = self.TimeWindow[i]
+
+            fqtfitmodel_convolved = (
+                fqtfitsampled_i
+                * scale
+                * timewin_i
+            )
+
+            # Reverse:
+            # fqt = deltaomega * real(ifft(sqw_i)) * Nw
+            sqwfit_ordered = (
+                np.fft.fft(fqtfitmodel_convolved)
+                / (deltaomega * Nw)
+            )
+
+            # Return to original omega ordering
+            sqwfit = np.empty_like(
+                np.real(sqwfit_ordered)
+            )
+
+            sqwfit[IndexFFT] = np.real(
+                sqwfit_ordered
+            )
+
+            self.fqtfitsampled.append(
+                fqtfitsampled_i
+            )
+
+            self.fqtfitmodel_convolved.append(
+                fqtfitmodel_convolved
+            )
+
+            self.sqwfitmodel.append(
+                sqwfit
+            )
+
+            # =====================================================
+            # PLOTTING FOR THIS Q
+            # =====================================================
+
+            r, c = divmod(i, cols)
+
+            inner = outer[r, c].subgridspec(
+                2,
+                1,
+                height_ratios=[4, 1],
+                hspace=0.05
+            )
+
+            ax0 = fig3.add_subplot(inner[0])
+            ax1 = fig3.add_subplot(
+                inner[1],
+                sharex=ax0
+            )
+
+            # -----------------------------------------------------
+            # Main S(Q,w) plot
+            # -----------------------------------------------------
+            
+
+            ax0.plot(
+                w,
+                sqwfit,
+                '-',
+                color='red',
+                linewidth=2,
+                zorder=2,
+                label='Fitted model'
+            )
+            
+            ax0.errorbar(
+                w,
+                self.sqwsymcorrnorm[i],
+                yerr=self.sqwerrorsymcorrnorm[i],
+                fmt='.',
+                ecolor = '#9d9e9d',
+                capsize=3,
+                zorder=1,
+                label='QENS Data'
+            )
+
+            ax0.set(
+                ylabel='S(Q,ω)',
+                yscale=yscale,
+                xlim=xlim,
+                ylim=ylim,
+                title=f'Q={self.Q[i]} $Å^{{-1}}$'
+            )
+
+            ax0.legend(
+                loc='best',
+                prop={'size': 12}
+            )
+
+            # Hide x labels on upper panel
+            plt.setp(
+                ax0.get_xticklabels(),
+                visible=False
+            )
+
+            residuals = (
+                self.sqwsymcorrnorm[i]
+                - sqwfit
+            )
+
+            ax1.axhline(
+                            0,
+                            linewidth=1.5,
+                            zorder=2,
+                        )
+            
+            ax1.errorbar(
+                w,
+                residuals,
+                yerr=self.sqwerrorsymcorrnorm[i],
+                fmt='.',
+                ecolor='#9d9e9d',
+                capsize=3,
+                zorder=1
+            )
+
+            ax1.set(
+                xlabel='Energy (meV)',
+                ylabel='Data - Fit',
+                xlim=xlim
+            )
+
+            # -----------------------------------------------------
+            # Chi-square inside plotted x-range
+            # -----------------------------------------------------
+            if xlim is not None:
+                mask = (
+                    (w >= xlim[0])
+                    & (w <= xlim[1])
+                )
             else:
-                ax3[0,1].errorbar(self.omegasym,self.sqwsymcorrnorm[i],yerr= self.sqwerrorsymcorrnorm[i], fmt='.',capsize=3,color='r',alpha=0.4, label = 'QENS Data')
-                ax3[0,1].errorbar(self.omegasym,self.sqwfitmodel[i],lw=4,color='k', label= 'Fitted model',zorder=1)
-                ax3[0,1].set(title='Q='+str(self.Q[i])+r'$Å^{-1}$',xlabel=r'$\hbar\omega$',ylabel=r'log(S($Q,\omega$))', yscale=yscale,xlim=xlim,ylim=ylim)
-                ax3[0,1].legend(loc=2,fontsize=12)
-                residuals = self.sqwfitmodel[i]-self.sqwsymcorrnorm[i]
-                ax3[1,1].errorbar(self.omegasym,residuals,yerr = self.sqwerrorsymcorrnorm[i],
-                        fmt='.',capsize=3,color='r',alpha=0.9,label='Residuals');  
-                ax3[1,1].plot(self.omegasym,np.zeros_like(self.omegasym),'k',lw=3);  
-                ax3[1,1].set(xlabel=r'$\hbar\omega$',ylabel=r'Residual')
-                ax3[1,1].legend(loc=4,fontsize=14)
+                mask = np.ones_like(
+                    w,
+                    dtype=bool
+                )
 
-                chi2_red, ndof, pval = calc_chi2(self.sqwsymcorrnorm[i],self.sqwfitmodel[i],
-                                            self.sqwerrorsymcorrnorm[i] )
-                d = {r"$\chi^2$=":"{:.2f}".format(chi2_red),
-                     }
-                text = nice_string_output(d, extra_spacing=0, decimals=3)
-                add_text_to_ax(0.05, 0.7, text, ax3[0,1], fontsize=16)
+            chi2_red, ndof, pval = calc_chi2(
+                self.sqwsymcorrnorm[i][mask],
+                sqwfit[mask],
+                self.sqwerrorsymcorrnorm[i][mask]
+            )
 
-            if not showplot:
-                plt.close(fig3)
-            if saveplot and i % 2:
-                fig3.savefig('./figure/'+self.filename+str(i)+'_fittedmodelcomparision.png', dpi=600) 
+            fit_text = (
+                rf'$\chi^2_\mathrm{{red}}$ = {chi2_red:.2f}'
+                '\n'
+                rf'Ndof = {ndof}'
+                '\n'
+                rf'$p$ = {pval:.3f}'
+            )
+
+            ax0.text(
+                0.97,
+                0.78,
+                fit_text,
+                transform=ax0.transAxes,
+                ha='right',
+                va='top',
+                fontsize=11,
+                bbox=dict(
+                    boxstyle='round',
+                    facecolor='white',
+                    alpha=0.8
+                )
+            )
+
+        for j in range(self.NQ, rows*cols):
+
+            r, c = divmod(j, cols)
+
+            ax_empty = fig3.add_subplot(
+                outer[r, c]
+            )
+
+            ax_empty.axis('off')
+
+        if not showplot:
+            plt.close(fig3)
+
+        if saveplot:
+            fig3.savefig(
+                f'./figure/{self.filename}_fittedmodelcomparison.png',
+                dpi=600,
+                bbox_inches='tight'
+            )
